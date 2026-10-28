@@ -286,25 +286,38 @@ pub(crate) async fn parse_faucet_address(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<FaucetAddressParseRequest>,
 ) -> ApiResult<Json<FaucetAddressParsed>> {
-    require_faucet_address(&req.address)?;
+    let address = require_faucet_address(&req.address)?;
+    require_faucet_destination_pool(&address)?;
     Ok(Json(FaucetAddressParsed {
         to_account: development_account_for(&state.0.store, &req.address)?,
     }))
 }
 
-/// The pool a payment to `address` lands in. The SDK falls back to a unified
+/// The pool a payment to `address` lands in, or `None` if its receivers don't
+/// resolve to a pool Send and Faucet track. The SDK falls back to a unified
 /// address's transparent receiver when it has neither a supported Orchard
-/// (Ironwood) nor Sapling receiver.
-fn faucet_destination_pool(address: &Address) -> &'static str {
+/// (Ironwood) nor Sapling receiver; a Sapling receiver without Orchard is the
+/// gap this can't represent, since the wallet spends through Sapling there,
+/// not Ironwood or transparent.
+fn faucet_destination_pool(address: &Address) -> Option<&'static str> {
     match address {
-        Address::Transparent(_) => "transparent",
-        Address::Unified(unified)
-            if unified.has_transparent() && !unified.has_orchard() && !unified.has_sapling() =>
-        {
-            "transparent"
-        }
-        _ => "ironwood",
+        Address::Transparent(_) => Some("transparent"),
+        Address::Unified(unified) if unified.has_orchard() => Some("ironwood"),
+        Address::Unified(unified) if unified.has_sapling() => None,
+        Address::Unified(unified) if unified.has_transparent() => Some("transparent"),
+        _ => None,
     }
+}
+
+/// [`faucet_destination_pool`], rejecting an address whose receivers don't
+/// resolve to a pool Send and Faucet track (a Sapling receiver without
+/// Orchard) instead of mislabeling it.
+fn require_faucet_destination_pool(address: &Address) -> ApiResult<&'static str> {
+    faucet_destination_pool(address).ok_or_else(|| {
+        ApiError::bad_request(
+            "a unified destination with a Sapling receiver must also include an Ironwood receiver",
+        )
+    })
 }
 
 fn internal_faucet_destination(
@@ -351,8 +364,10 @@ fn faucet_address_response(
 fn external_faucet_response(payment: AddressFaucet) -> anyhow::Result<FaucetAddressResponse> {
     let address = Address::decode(&regtest_network(), &payment.address)
         .context("stored address faucet payment has an unparsable address")?;
+    let destination_pool = faucet_destination_pool(&address)
+        .context("stored address faucet payment has an unsupported destination pool")?;
     Ok(FaucetAddressResponse {
-        destination_pool: faucet_destination_pool(&address),
+        destination_pool,
         address: payment.address,
         amount_zatoshi: payment.amount_zatoshi,
         txid: payment.txid,
@@ -446,7 +461,7 @@ pub(crate) async fn faucet_address(
             "amount must be greater than zero and no more than 5 ZEC",
         ));
     }
-    let pool = faucet_destination_pool(&address);
+    let pool = require_faucet_destination_pool(&address)?;
     require_non_dust_amount(req.amount_zatoshi, pool == "transparent")?;
     // An existing external claim keeps its store even if the address later
     // becomes a development-account address.

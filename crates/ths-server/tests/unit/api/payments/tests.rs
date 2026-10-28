@@ -149,7 +149,7 @@ impl AddressFaucetRuntime for RecordingAddressFaucetRuntime {
         anyhow::ensure!(!self.fail_external, "external funding failed");
         Ok(FaucetAddressResponse {
             destination_pool: Address::decode(&regtest_network(), &req.address)
-                .map(|address| faucet_destination_pool(&address))
+                .and_then(|address| faucet_destination_pool(&address))
                 .unwrap_or("ironwood"),
             address: req.address,
             amount_zatoshi: req.amount_zatoshi,
@@ -464,6 +464,34 @@ async fn parse_faucet_address_accepts_what_the_send_rule_rejects() {
         "POST",
         "/api/v1/faucet/address/parse",
         json!({"address": "not-an-address"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+}
+
+#[tokio::test]
+async fn faucet_rejects_a_unified_address_with_sapling_but_no_orchard_receiver() {
+    // A Sapling-only unified address has no pool value this system can
+    // report: the wallet would select Sapling, but the pool vocabulary is
+    // transparent/ironwood only. Reject the shape rather than mislabel it.
+    let (state, _dir) = offline_state();
+    let address = sapling_only_unified_address(&regtest_network());
+
+    let (status, response) = api_request(
+        &state,
+        "POST",
+        "/api/v1/faucet/address/parse",
+        json!({"address": address}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+
+    let (status, response) = api_request(
+        &state,
+        "POST",
+        "/api/v1/faucet/address",
+        json!({"address": address, "amount_zatoshi": 100_000,
+            "idempotency_key": "sapling-only-pool"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
@@ -1126,6 +1154,23 @@ fn foreign_unified_address<P: zcash_protocol::consensus::Parameters>(params: &P)
     let (address, _) = usk
         .to_unified_full_viewing_key()
         .default_address(UnifiedAddressRequest::AllAvailableKeys)
+        .unwrap();
+    address.encode(params)
+}
+
+/// A unified address with a Sapling receiver and no Orchard receiver.
+fn sapling_only_unified_address<P: zcash_protocol::consensus::Parameters>(params: &P) -> String {
+    use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest, UnifiedSpendingKey};
+    let usk = UnifiedSpendingKey::from_seed(params, &[9u8; 32], zip32::AccountId::ZERO).unwrap();
+    let request = UnifiedAddressRequest::custom(
+        ReceiverRequirement::Omit,
+        ReceiverRequirement::Require,
+        ReceiverRequirement::Omit,
+    )
+    .unwrap();
+    let (address, _) = usk
+        .to_unified_full_viewing_key()
+        .default_address(request)
         .unwrap();
     address.encode(params)
 }
